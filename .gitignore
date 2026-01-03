@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Training outputs
+checkpoints/
+logs/
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Datasets (never commit)
+Dataset/
+SUNRGBD/
+*.zip
+*.npy
+
+# Torch cache
+torch_cache/
