@@ -10,6 +10,11 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import sys
+import torchvision.utils as vutils
+from torchvision.utils import make_grid
+from torchvision import transforms as T
+import torch.nn.functional as F
+
 
 # Add paths
 sys.path.insert(0, os.path.dirname(__file__))
@@ -92,19 +97,12 @@ def create_dataloader(config, split='train'):
     """Create data loader from configuration."""
     datasets = []
     
-    if 'ibims' in config.datasets and split == 'train':
-        if os.path.exists(config.ibims_root):
-            ibims = IBimsDataset(config.ibims_root, target_size=config.target_size)
-            datasets.append(ibims)
-            print(f"Added IBIMS dataset: {len(ibims)} samples")
-    
     if 'sunrgbd' in config.datasets:
-        if os.path.exists(config.sunrgbd_json) and os.path.exists(config.sunrgbd_root):
+        if os.path.exists(config.sunrgbd_root):
             sunrgbd = SUNRGBDDataset(
-                config.sunrgbd_json,
                 config.sunrgbd_root,
-                target_size=config.target_size,
-                use_bfx_depth=config.use_bfx_depth
+                img_size=config.target_size
+                #transform = None
             )
             datasets.append(sunrgbd)
             print(f"Added SUNRGBD dataset: {len(sunrgbd)} samples")
@@ -120,15 +118,15 @@ def create_dataloader(config, split='train'):
             datasets.append(nyu)
             print(f"Added NYU dataset: {len(nyu)} samples")
     
-    if 'da2k' in config.datasets and split == 'train':
-        if os.path.exists(config.da2k_root) and os.path.exists(config.da2k_annotation):
-            da2k = DA2KRelativeDataset(
-                config.da2k_root,
-                config.da2k_annotation,
-                target_size=config.target_size
+    if 'realsense' in config.datasets:
+        if os.path.exists(config.realsense_root) and os.path.exists(config.realsense_csv):
+            realsense = RealsenseDataset(
+                config.realsense_csv,
+                config.realsense_root,
+                img_size = config.target_size
             )
-            datasets.append(da2k)
-            print(f"Added DA2K dataset: {len(da2k)} samples")
+            datasets.append(realsense)
+            print(f"Added Realsense dataset: {len(realsense)} samples")
     
     if len(datasets) == 0:
         raise ValueError(f"No valid datasets found for split '{split}'")
@@ -164,14 +162,71 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, writer, 
         image = batch['image'].to(device)
         depth = batch['depth'].to(device)
         mask = batch.get('mask', torch.ones_like(depth, dtype=torch.bool)).to(device)
+        intrinsics = batch.get('intrinsics', None)
+        if intrinsics is not None:
+            intrinsics = intrinsics.to(device)
         
         # Forward pass
         optimizer.zero_grad()
-        output = model(image)
+        output = model(image, intrinsics=intrinsics)
         
         # Compute loss
         losses = criterion(output, depth, mask)
         
+        # ---------------- DEBUG: Pyramid–Depth Correlation ----------------
+        if batch_idx % config.log_interval == 0:
+            with torch.no_grad():
+                # ---------------- TRAIN VISUALIZATION ----------------
+                # Take first sample only
+                img = image[0].cpu()
+                depth_gt = depth[0].cpu()
+                depth_pred = output['metric_depth'][0].cpu()
+                
+                depth_pred = F.interpolate(
+                    depth_pred.unsqueeze(0),  # add batch dim: (1, 1, h, w)
+                    size=(image.shape[2], image.shape[3]),  # or hardcode (392, 392) if fixed
+                    mode='bilinear',
+                    align_corners=True
+                ).squeeze(0)  # back to (1, H, W)
+
+                # Ensure (1, H, W)
+                if depth_gt.ndim == 2:
+                    depth_gt = depth_gt.unsqueeze(0)
+                if depth_pred.ndim == 2:
+                    depth_pred = depth_pred.unsqueeze(0)
+
+                # Denormalize RGB
+                denormalize = T.Normalize(
+                    mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+                    std=[1/0.229, 1/0.224, 1/0.225]
+                )
+                img_vis = denormalize(img).clamp(0, 1)
+
+                # Normalize depth maps independently
+                def norm_depth(d):
+                    return (d - d.min()) / (d.max() - d.min() + 1e-8)
+
+                depth_gt_norm = norm_depth(depth_gt)
+                depth_pred_norm = norm_depth(depth_pred)
+
+                # Convert depth → 3-channel
+                gt_rgb = depth_gt_norm.repeat(3, 1, 1)
+                pred_rgb = depth_pred_norm.repeat(3, 1, 1)
+                
+                #img_vis_small = F.interpolate(img_vis.unsqueeze(0), size=(224, 224), mode='bilinear').squeeze(0)
+                #gt_rgb_small = F.interpolate(gt_rgb.unsqueeze(0), size=(224, 224), mode='bilinear').squeeze(0)
+                #torch.stack([img_vis_small, gt_rgb_small, pred_rgb], dim=0)
+
+                # Stack: RGB | GT | Pred
+                grid = make_grid(
+                torch.stack([img_vis, gt_rgb, pred_rgb], dim=0),
+                nrow=3,
+                padding=10
+                )
+
+                global_step = epoch * len(dataloader) + batch_idx
+                writer.add_image("Train/Prediction", grid, global_step)
+# ---------------------------------------------------
         # Backward pass
         losses['total'].backward()
         
@@ -224,10 +279,19 @@ def validate(model, dataloader, criterion, device, epoch, writer, config):
     max_val_samples = int(0.2 * total_val_samples)
     max_val_batches = max(1, max_val_samples // config.batch_size)
     
-    # Metrics - accumulate properly for pixel-wise calculation
-    all_preds = []
-    all_targets = []
-    all_masks = []
+    # Metrics - accumulate incrementally to avoid OOM
+    # Instead of storing all batches, compute metrics in chunks
+    metrics_accum = {
+        'd1': 0.0, 'd2': 0.0, 'd3': 0.0,
+        'abs_rel': 0.0, 'sq_rel': 0.0,
+        'rmse': 0.0, 'rmse_log': 0.0,
+        'log10': 0.0, 'silog': 0.0
+    }
+    total_valid_pixels = 0
+    
+    # Store a few samples for visualization
+    viz_samples = []
+    max_viz_samples = 4
     
     pbar = tqdm(dataloader, desc=f"Val {epoch}")
     
@@ -239,9 +303,12 @@ def validate(model, dataloader, criterion, device, epoch, writer, config):
         image = batch['image'].to(device)
         depth = batch['depth'].to(device)
         mask = batch.get('mask', torch.ones_like(depth, dtype=torch.bool)).to(device)
+        intrinsics = batch.get('intrinsics', None)
+        if intrinsics is not None:
+            intrinsics = intrinsics.to(device)
         
         # Forward pass
-        output = model(image)
+        output = model(image, intrinsics=intrinsics)
         pred = output['metric_depth']
         
         # Ensure same size
@@ -260,7 +327,18 @@ def validate(model, dataloader, criterion, device, epoch, writer, config):
         loss_dict['metric_silog'] += losses['metric_silog'].item()
         num_batches += 1
         
-        # Store predictions and targets for metric computation
+        # Store samples for visualization (first batch only)
+        if batch_idx == 0 and len(viz_samples) < max_viz_samples:
+            # Store on CPU for visualization
+            batch_size = min(image.shape[0], max_viz_samples - len(viz_samples))
+            for i in range(batch_size):
+                viz_samples.append({
+                    'image': image[i].cpu(),
+                    'depth': depth[i].cpu(),
+                    'pred': pred[i].cpu(),
+                })
+        
+        # Compute metrics incrementally to avoid OOM
         # Apply proper masking: valid pixels = (mask == True) AND (depth > 0)
         valid_mask = mask.bool() & (depth > 0)
         
@@ -269,10 +347,29 @@ def validate(model, dataloader, criterion, device, epoch, writer, config):
         pred_clamped = torch.clamp(pred, min=eps)
         depth_clamped = torch.clamp(depth, min=eps)
         
-        # Store for batch-wise metric computation (keep spatial structure)
-        all_preds.append(pred_clamped.cpu())
-        all_targets.append(depth_clamped.cpu())
-        all_masks.append(valid_mask.cpu())
+        # Compute metrics on this batch (incremental)
+        pred_batch = pred_clamped.squeeze(1)  # (B, H, W)
+        target_batch = depth_clamped.squeeze(1)  # (B, H, W)
+        mask_batch = valid_mask.squeeze(1)  # (B, H, W)
+        
+        # Get valid pixels for this batch
+        pred_valid = pred_batch[mask_batch]  # (M_batch,)
+        target_valid = target_batch[mask_batch]  # (M_batch,)
+        
+        if len(pred_valid) > 0:
+            # Compute metrics on this batch
+            pred_for_metrics = pred_valid.unsqueeze(0).unsqueeze(0)  # (1, 1, M_batch)
+            target_for_metrics = target_valid.unsqueeze(0).unsqueeze(0)  # (1, 1, M_batch)
+            
+            batch_metrics = eval_depth(pred_for_metrics, target_for_metrics)
+            
+            # Weighted accumulation (by number of valid pixels)
+            n_valid = len(pred_valid)
+            total_valid_pixels += n_valid
+            
+            # Accumulate weighted metrics
+            for key in metrics_accum:
+                metrics_accum[key] += batch_metrics[key] * n_valid
         
         pbar.set_postfix({'loss': f"{losses['total'].item():.4f}", 
                          'batches': f"{batch_idx+1}/{max_val_batches}"})
@@ -282,44 +379,43 @@ def validate(model, dataloader, criterion, device, epoch, writer, config):
     for key in loss_dict:
         loss_dict[key] /= num_batches
     
-    # Compute metrics on all collected batches properly
-    metrics_accum = {
-        'd1': 0.0, 'd2': 0.0, 'd3': 0.0,
-        'abs_rel': 0.0, 'sq_rel': 0.0,
-        'rmse': 0.0, 'rmse_log': 0.0,
-        'log10': 0.0, 'silog': 0.0
-    }
+    # Finalize metrics (weighted average by valid pixels)
+    if total_valid_pixels > 0:
+        for key in metrics_accum:
+            metrics_accum[key] /= total_valid_pixels
+    else:
+        print("Warning: No valid pixels found for metric computation")
     
-    if len(all_preds) > 0:
-        # Concatenate all batches
-        pred_all = torch.cat(all_preds, dim=0)  # (N, 1, H, W)
-        target_all = torch.cat(all_targets, dim=0)  # (N, 1, H, W)
-        mask_all = torch.cat(all_masks, dim=0)  # (N, 1, H, W)
+    # Log visualization images to TensorBoard
+    if len(viz_samples) > 0:
+        denormalize = T.Normalize(
+        mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+        std=[1/0.229, 1/0.224, 1/0.225]
+    )
+    
+    for i, sample in enumerate(viz_samples):
+        # Denormalize RGB image
+        img_vis = denormalize(sample['image']).clamp(0, 1)
         
-        # Apply mask: only compute metrics on valid pixels
-        # Convert to (N, H, W) for easier masking
-        pred_flat = pred_all.squeeze(1)  # (N, H, W)
-        target_flat = target_all.squeeze(1)  # (N, H, W)
-        mask_flat = mask_all.squeeze(1)  # (N, H, W)
+        # Normalize depth maps individually to [0,1] for visualization
+        depth_gt = sample['depth']
+        depth_pred = sample['pred']
         
-        # Get valid pixels only
-        pred_valid = pred_flat[mask_flat]  # (M,) - flattened valid pixels
-        target_valid = target_flat[mask_flat]  # (M,) - flattened valid pixels
+        depth_gt_norm = (depth_gt - depth_gt.min()) / (depth_gt.max() - depth_gt.min() + 1e-8)
+        depth_pred_norm = (depth_pred - depth_pred.min()) / (depth_pred.max() - depth_pred.min() + 1e-8)
         
-        if len(pred_valid) > 0:
-            # Reshape to (1, 1, M) for eval_depth function
-            # This maintains compatibility with the existing metric function
-            pred_for_metrics = pred_valid.unsqueeze(0).unsqueeze(0)  # (1, 1, M)
-            target_for_metrics = target_valid.unsqueeze(0).unsqueeze(0)  # (1, 1, M)
-            
-            # Compute metrics
-            metrics = eval_depth(pred_for_metrics, target_for_metrics)
-            
-            # Store metrics
-            for key in metrics_accum:
-                metrics_accum[key] = metrics[key]
-        else:
-            print("Warning: No valid pixels found for metric computation")
+        # Convert grayscale depth to RGB by repeating channels
+        gt_rgb = depth_gt_norm.repeat(3, 1, 1)
+        pred_rgb = depth_pred_norm.repeat(3, 1, 1)
+        
+        # Stack as (3, 3, H, W) → N=3 images, each C=3
+        three_images = torch.stack([img_vis, gt_rgb, pred_rgb], dim=0)
+        
+        # Create grid: 1 row, 3 columns (or nrow=1 for vertical)
+        grid = make_grid(three_images, nrow=3, padding=10, normalize=False)
+        # grid now has shape (3, H_grid, W_grid) → perfect for add_image
+        
+        writer.add_image(f'Val/Sample_{i}', grid, epoch)  #
     
     # Log to tensorboard
     writer.add_scalar('Val/Loss', avg_loss, epoch)
@@ -334,29 +430,37 @@ def validate(model, dataloader, criterion, device, epoch, writer, config):
 
 
 def save_checkpoint(model, optimizer, epoch, loss, save_dir, is_best=False):
-    """Save model checkpoint."""
+    """Save checkpoints:
+    - Always overwrite 'checkpoint_latest.pth' (with optimizer for resuming)
+    - Save 'checkpoint_best.pth' only when validation improves (without optimizer to save space)
+    """
     os.makedirs(save_dir, exist_ok=True)
     
-    checkpoint = {
-        'epoch': epoch,
+    # Full checkpoint for resuming training (includes optimizer)
+    latest_checkpoint = {
+        'epoch': epoch + 1,                  # next epoch to start from
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
     }
     
-    # Save latest
+    # Lightweight best checkpoint (only weights + epoch, smaller size)
+    best_checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+    }
+    
+    # Always overwrite the latest checkpoint (after every epoch)
     latest_path = os.path.join(save_dir, 'checkpoint_latest.pth')
-    torch.save(checkpoint, latest_path)
+    torch.save(latest_checkpoint, latest_path)
+    print(f"Updated latest checkpoint: {latest_path}")
     
-    # Save epoch checkpoint
-    epoch_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
-    torch.save(checkpoint, epoch_path)
-    
-    # Save best
+    # Save best model only when improved
     if is_best:
         best_path = os.path.join(save_dir, 'checkpoint_best.pth')
-        torch.save(checkpoint, best_path)
-        print(f"Saved best checkpoint to {best_path}")
+        torch.save(best_checkpoint, best_path)
+        print(f"Saved NEW BEST checkpoint: {best_path}")
+
 
 
 def load_checkpoint(model, optimizer, checkpoint_path, device):
@@ -547,7 +651,7 @@ if __name__ == '__main__':
     # Data configuration
     parser.add_argument('--datasets', type=str, nargs='+', 
                        default=['nyu', 'sunrgbd'], 
-                       choices=['nyu', 'sunrgbd', 'ibims', 'da2k'])
+                       choices=['nyu', 'sunrgbd','realsense'])
     parser.add_argument('--target-size', type=int, default=384)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--pin-memory', action='store_true', default=True)
@@ -555,12 +659,9 @@ if __name__ == '__main__':
     # Dataset paths
     parser.add_argument('--nyu-csv', type=str, default='')
     parser.add_argument('--nyu-root', type=str, default='')
-    parser.add_argument('--sunrgbd-json', type=str, default='')
     parser.add_argument('--sunrgbd-root', type=str, default='')
-    parser.add_argument('--use-bfx-depth', action='store_true', default=False)
-    parser.add_argument('--ibims-root', type=str, default='')
-    parser.add_argument('--da2k-root', type=str, default='')
-    parser.add_argument('--da2k-annotation', type=str, default='')
+    parser.add_argument('--realsense-csv', type=str, default='')
+    parser.add_argument('--realsense-root', type=str, default='')
     
     # Checkpointing
     parser.add_argument('--save-dir', type=str, default='./checkpoints')
