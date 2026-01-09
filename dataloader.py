@@ -11,248 +11,125 @@ from scipy.io import loadmat
 from tqdm import tqdm
 import pandas as pd
 import torchvision.transforms.functional as TF
+from glob import glob
+import torch.nn.functional as F
 
+class SUNRGBDDataset(Dataset):
+    def __init__(self, root_dir, img_size=384):
+        self.root_dir = root_dir
+        self.img_size = img_size
 
+        self.rgb_paths = []
+        self.depth_paths = []
+        self.intrinsic_paths = []
 
-class IBimsDataset(Dataset):
-    def __init__(self, root, target_size=384):
-        self.root = root
-        self.target_size = target_size
+        print(f"Scanning root directory: {root_dir}")
 
-        all_files = sorted([f for f in os.listdir(root) if f.endswith(".mat")])
+        # Check if root_dir exists
+        if not os.path.exists(root_dir):
+            raise ValueError(f"Root directory does not exist: {root_dir}")
 
-        self.mat_files = []
-        for f in all_files:
-            fp = os.path.join(root, f)
-            if os.path.exists(fp):
-                self.mat_files.append(f)
-            else:
-                print(f"Warning: Missing MAT file → {fp}")
+        scene_count = 0
+        for scene in sorted(os.listdir(root_dir)):
+            scene_path = os.path.join(root_dir, scene)
+            if not os.path.isdir(scene_path):
+                print(f"Skipping non-directory: {scene}")
+                continue
 
-        print(f"IBIMS: {len(self.mat_files)} valid samples")
+            rgb_dir = os.path.join(scene_path, "image")
+            depth_dir = os.path.join(scene_path, "depth_bfx")
+            intrinsic_path = os.path.join(scene_path, "intrinsics.txt")
+            # Use more flexible glob patterns
+            rgb_files = sorted(glob(os.path.join(rgb_dir, "*.jpg")) + 
+                            glob(os.path.join(rgb_dir, "*.png")) + 
+                            glob(os.path.join(rgb_dir, "*.jpeg")))
+            
+            depth_files = sorted(glob(os.path.join(depth_dir, "*.png")))
 
-        self.transform = T.Compose([
+            if len(rgb_files) == 0:
+                print(f"  → No RGB images found in {rgb_dir}")
+                continue
+            if len(depth_files) == 0:
+                print(f"  → No depth images found in {depth_dir}")
+                continue
+
+            if len(rgb_files) != len(depth_files):
+                print(f"  → Mismatch: {len(rgb_files)} RGB vs {len(depth_files)} depth → skipping scene")
+                continue
+
+            self.rgb_paths.extend(rgb_files)
+            self.depth_paths.extend(depth_files)
+            self.intrinsic_paths.extend([intrinsic_path] * len(rgb_files))
+
+            scene_count += 1
+
+        print(f"Found {scene_count} valid scenes")
+        
+        # RGB → Tensor
+        self.rgb_transform = T.Compose([
+            T.Resize((img_size, img_size)),
             T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
         ])
 
+
+        # HARD SAFETY CHECK
+        if len(self.rgb_paths) == 0:
+            raise AssertionError("SUNRGBD dataset is empty - no valid scenes found. Check paths and file extensions.")
+
+        assert len(self.rgb_paths) == len(self.depth_paths) == len(self.intrinsic_paths), \
+            "RGB / Depth / Intrinsic length mismatch"
+
+        print(f"[SUNRGBD] Successfully loaded {len(self.rgb_paths)} samples")
     def __len__(self):
-        return len(self.mat_files)
+        return len(self.rgb_paths)
 
     def __getitem__(self, idx):
+        # ---------- RGB ----------
+        rgb_pil = Image.open(self.rgb_paths[idx]).convert("RGB")
+        orig_w, orig_h = rgb_pil.size
+        rgb = self.rgb_transform(rgb_pil)
 
-        file_path = os.path.join(self.root, self.mat_files[idx])
-        data = loadmat(file_path)
-        s = data['data'][0, 0]
-
-        # --- load RGB ---
-        rgb = s['rgb']   # H×W×3 numpy
-        rgb = cv2.resize(rgb, (self.target_size, self.target_size))
-
-        # Convert to tensor CHW
-        rgb = self.transform(rgb)   # will NOT resize
-
-        # --- load Depth ---
-        depth = s['depth'].astype(np.float32)
-        depth = cv2.resize(depth, (self.target_size, self.target_size), cv2.INTER_NEAREST)
+        # ---------- DEPTH ----------
+        depth = np.array(Image.open(self.depth_paths[idx]), dtype=np.float32)
+        depth = depth / 1000.0  # mm → meters
 
         depth = torch.from_numpy(depth).unsqueeze(0)
-        depth = torch.clamp(depth, 1e-4, 20.0)
+        depth = F.interpolate(
+            depth.unsqueeze(0),
+            size=(self.img_size, self.img_size),
+            mode="nearest",
+        ).squeeze(0)
 
-        # Apply ImageNet normalization to match model expectations
-        normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        rgb = normalize(rgb)
-        
-        return {
-            "image": rgb.float(),
-            "depth": depth.float(),
-            "name": self.mat_files[idx],
-            # training helpers to align with ZoeDepth trainer API
-            "mask": torch.ones_like(depth, dtype=torch.bool),
-            "dataset": "ibims",
-        }
+        mask = depth > 0
+        depth = torch.clamp(depth, 0.1, 80.0)
 
+        # ---------- INTRINSICS ----------
+        K = np.loadtxt(self.intrinsic_paths[idx]).astype(np.float32)
 
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
 
-class DA2KRelativeDataset(Dataset):
-    def __init__(self, root_dir, annotation_file="annotations.json", transform=None, target_size=384, verbose=True):
-        self.root_dir = root_dir
-        self.annotation_path = annotation_file  # now full path or just filename
-        self.target_size = target_size
-        self.verbose = verbose
+        sx = self.img_size / orig_w
+        sy = self.img_size / orig_h
 
-        # Load annotations
-        with open(self.annotation_path, 'r') as f:
-            self.raw_annotations = json.load(f)
-
-        # Build valid image list
-        self.samples = []
-        print("Scanning and validating images...")
-        for rel_path in tqdm(sorted(self.raw_annotations.keys()), disable=not verbose):
-            # Try different possible root combinations
-            candidate_paths = [
-                os.path.join(self.root_dir, rel_path.replace("/", os.sep)),
-                os.path.join(self.root_dir, os.path.basename(rel_path)),  # just filename
-                os.path.join(self.root_dir, *rel_path.split("/")[1:]),    # strip first folder if duplicated
-                rel_path,  # absolute? (unlikely)
-            ]
-
-            img_path = None
-            for cand in candidate_paths:
-                if os.path.exists(cand):
-                    img_path = cand
-                    break
-
-            if img_path is None:
-                if self.verbose:
-                    print(f"Warning: Image not found, skipping: {rel_path}")
-                continue
-
-            self.samples.append({
-                "image_path": img_path,
-                "rel_path": rel_path,  # key in JSON
-            })
-
-        print(f"Found {len(self.samples)} / {len(self.raw_annotations)} valid images.")
-
-        self.transform = transform or T.Compose([
-            T.Resize((target_size, target_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225])
-        ])
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample_info = self.samples[idx]
-        img_path = sample_info["image_path"]
-        rel_path = sample_info["rel_path"]
-
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            # Return a black image + empty annotations as fallback
-            dummy = torch.zeros(3, self.target_size, self.target_size)
-            return {
-                "image": dummy,
-                "image_path": rel_path,
-                "points1": torch.zeros(0, 2, dtype=torch.long),
-                "points2": torch.zeros(0, 2, dtype=torch.long),
-                "closer_is_point1": torch.zeros(0, dtype=torch.bool),
-                "num_pairs": 0
-            }
-
-        orig_w, orig_h = image.size
-        image_tensor = self.transform(image)
-
-        # Get annotations
-        raw_annotations = self.raw_annotations[rel_path]
-
-        points1 = []
-        points2 = []
-        closer_is_point1 = []
-
-        h_ratio = self.target_size / orig_h
-        w_ratio = self.target_size / orig_w
-
-        for ann in raw_annotations:
-            p1 = ann["point1"]
-            p2 = ann["point2"]
-
-            p1_resized = [int(round(p1[0] * h_ratio)), int(round(p1[1] * w_ratio))]
-            p2_resized = [int(round(p2[0] * h_ratio)), int(round(p2[1] * w_ratio))]
-
-            points1.append(p1_resized)
-            points2.append(p2_resized)
-            closer_is_point1.append(ann["closer_point"] == "point1")
+        intrinsics = torch.tensor(
+            [fx * sx, fy * sy, cx * sx, cy * sy],
+            #[fx, fy, cx, cy],
+            dtype=torch.float32,
+        )
 
         return {
-            "image": image_tensor
-        }
-        
-class SUNRGBDDataset(Dataset):
-    def __init__(self, json_file, root_dir, target_size=392,use_bfx_depth=True, transform=None):
-        self.root_dir = root_dir
-        self.target_size = target_size
-        self.use_bfx_depth = use_bfx_depth
-
-        with open(json_file, 'r') as f:
-            raw = json.load(f)
-
-        self.data = []
-        missing = 0
-
-        for item in raw:
-            rgb_path = os.path.join(root_dir, item["image"])
-            depth_key = "depth_bfx" if use_bfx_depth and "depth_bfx" in item else "depth"
-            depth_path = os.path.join(root_dir, item[depth_key])
-
-            if not (os.path.exists(rgb_path) and os.path.exists(depth_path)):
-                missing += 1
-                continue
-
-            self.data.append(item)
-
-        print(f"SUNRGBD: {len(self.data)} valid samples, {missing} missing")
-        
-        self.rgb_transform = transform or T.Compose([
-            T.Resize((target_size, target_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        self.depth_transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((target_size, target_size), interpolation=T.InterpolationMode.NEAREST),
-            T.ToTensor()
-        ])
-        
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        item = self.data[idx]
-
-        # Load RGB
-        rgb_path = os.path.join(self.root_dir, item["image"])
-        try:
-            rgb = Image.open(rgb_path).convert("RGB")
-        except Exception as e:
-            print(f"Error loading RGB {rgb_path}: {e}")
-            rgb = Image.new("RGB", (640, 480), (0, 0, 0))
-
-        # Load Depth (use depth_bfx if requested and exists)
-        depth_key = "depth_bfx" if self.use_bfx_depth and "depth_bfx" in item else "depth"
-        depth_path = os.path.join(self.root_dir, item[depth_key])
-
-        try:
-            depth_img = Image.open(depth_path)  # 16-bit PNG
-            depth = np.array(depth_img, dtype=np.float32)
-            # SUN RGB-D depth is in millimeters → convert to meters
-            depth = depth / 1000.0
-        except Exception as e:
-            print(f"Error loading depth {depth_path}: {e}")
-            depth = np.zeros((480, 640), dtype=np.float32)
-
-        # Resize & tensor
-        rgb_tensor = self.rgb_transform(rgb)
-
-        depth_tensor = torch.from_numpy(depth).unsqueeze(0)  # 1×H×W
-        depth_tensor = self.depth_transform(depth_tensor)
-        depth_tensor = torch.clamp(depth_tensor, 0.1, 10.0)  # indoor range
-
-        return {
-            "image": rgb_tensor,           # (3, H, W)
-            "depth": depth_tensor,         # (1, H, W)
-            "rgb_path": item["image"],
-            "depth_path": item[depth_key],
+            "image": rgb,            # [3,384,384]
+            "depth": depth,          # [1,384,384]
+            "mask": mask,            # [1,384,384]
+            "intrinsics": intrinsics,# [4]
             "dataset": "sunrgbd",
-            "mask": torch.ones_like(depth_tensor, dtype=torch.bool),
-            #"annotations": item.get("annotations", [])  # optional: for future use
         }
-
+                                            
 class NYUDataset(Dataset):
     def __init__(self, csv_file, root_dir, target_size=384, is_test=False):
         self.root_dir = root_dir
@@ -268,6 +145,9 @@ class NYUDataset(Dataset):
         with open(csv_file, "r") as f:
             reader = csv.reader(f)
             for row in reader:
+                if len(self.rgb_paths) >= 100:
+                    break
+
                 if len(row) < 2:
                     continue
 
@@ -345,26 +225,26 @@ class RealsenseDataset(Dataset):
                         std=[0.229, 0.224, 0.225])
         ])
 
-    def load_depth(self, path):
+    def load_depth(self, path, depth_scale):
         depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if depth is None:
             raise FileNotFoundError(path)
 
         depth = depth.astype(np.float32)
 
-        # mm → meters (adjust if your depths are already in meters)
-        if depth.max() > 100:
-            depth /= 1000.0
+        # Proper scaling using CSV
+        depth *= float(depth_scale)
 
         depth = cv2.resize(
-            depth, (self.img_size, self.img_size),
+            depth,
+            (self.img_size, self.img_size),
             interpolation=cv2.INTER_NEAREST
         )
 
-        depth = torch.from_numpy(depth).unsqueeze(0)
+        depth = torch.from_numpy(depth).unsqueeze(0)  # (1, H, W)
         mask = depth > 0
 
-        depth = torch.clamp(depth, 0.1, 80.0)  # Adjust max if needed for your phantom data
+        depth = torch.clamp(depth, 0.1, 80.0)
 
         return depth, mask
 
@@ -374,21 +254,42 @@ class RealsenseDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
 
-        # Use raw strings for safety with backslashes
         rgb_path = os.path.join(self.root_dir, row["rgb_path"].lstrip("\\/"))
-        rgb_path = r'{}'.format(rgb_path)  # Or simply rf"{os.path.join(...)}" in Python 3.12+
-
         depth_path = os.path.join(self.root_dir, row["depth_raw_path"].lstrip("\\/"))
-        depth_path = r'{}'.format(depth_path)
 
+        # ---- RGB ----
         rgb = Image.open(rgb_path).convert("RGB")
         rgb = self.rgb_transform(rgb)
 
-        depth, mask = self.load_depth(depth_path)
+        # ---- Depth ----
+        depth, mask = self.load_depth(
+            depth_path,
+            depth_scale=row["depth_scale"]
+        )
+
+        # ---- Intrinsics (scaled correctly) ----
+        fx = float(row["fx"])
+        fy = float(row["fy"])
+        cx = float(row["cx"])
+        cy = float(row["cy"])
+
+        orig_w = float(row["width"])
+        orig_h = float(row["height"])
+
+        sx = self.img_size / orig_w
+        sy = self.img_size / orig_h
+
+        fx *= sx
+        fy *= sy
+        cx *= sx
+        cy *= sy
+
+        intrinsics = torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
 
         return {
             "image": rgb,
             "depth": depth,
             "mask": mask,
+            "intrinsics": intrinsics,
             "dataset": "realsense",
         }
